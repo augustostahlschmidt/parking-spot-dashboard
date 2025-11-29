@@ -2,124 +2,73 @@ import os
 import time
 import webbrowser
 import subprocess
-import threading
 import sys
-import re
 
 SERVER_URL = "http://localhost:8000"
-PORT = 8000
 
 
-# ---------------------------------------
-# 1) Verifica e mata processo da porta
-# ---------------------------------------
-def kill_process_on_port(port):
-    print(f"[CHECK] Verificando processos na porta {port}...")
-
-    try:
-        result = subprocess.check_output(
-            f'netstat -ano | findstr :{port}',
-            shell=True, text=True, stderr=subprocess.STDOUT
-        )
-    except subprocess.CalledProcessError:
-        print(f"[CHECK] Porta {port} está livre.")
-        return
-
-    pids = set()
-
-    for line in result.splitlines():
-        parts = line.split()
-        if len(parts) >= 5:
-            pid = parts[-1]
-            if pid.isdigit():
-                pids.add(pid)
-
-    if not pids:
-        print(f"[CHECK] Porta {port} está livre.")
-        return
-
-    print(f"[KILL] Encontrados processos usando a porta {port}: {pids}")
-
-    for pid in pids:
-        try:
-            print(f"[KILL] Matando PID {pid} ...")
-            subprocess.run(f"taskkill /PID {pid} /F", shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        except Exception as e:
-            print(f"[KILL] Erro ao matar PID {pid}: {e}")
-
-    print(f"[KILL] Porta {port} está agora liberada.\n")
-
-
-# ---------------------------------------
-# 2) Stream seguro dos logs
-# ---------------------------------------
-def stream_output(pipe, prefix):
-    encoding = sys.stdout.encoding or "utf-8"
-
-    for line in iter(pipe.readline, b""):
-        text = line.decode(encoding, errors="replace")
-        sys.stdout.write(f"[{prefix}] {text}")
-    pipe.close()
-
-
-# ---------------------------------------
-# 3) Start do Uvicorn
-# ---------------------------------------
 def start_uvicorn():
-    print("[SERVER] Iniciando servidor uvicorn...")
+    print("[SERVER] Starting uvicorn...")
 
     process = subprocess.Popen(
         [
-            sys.executable, "-m", "uvicorn", "app:app",
+            sys.executable, "-m", "uvicorn",
+            "app:app",
             "--host", "0.0.0.0",
-            "--port", str(PORT)
-        ],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+            "--port", "8000",
+        ]
     )
 
-    print("[SERVER] Aguardando inicialização...")
+    # Wait a moment for the server to lift
     time.sleep(2)
-
-    threading.Thread(target=stream_output, args=(process.stdout, "UVICORN"), daemon=True).start()
-    threading.Thread(target=stream_output, args=(process.stderr, "UVICORN-ERR"), daemon=True).start()
-
     return process
 
 
-# ---------------------------------------
-# 4) Abre navegador
-# ---------------------------------------
 def open_browser():
-    print("[BROWSER] Abrindo dashboard no navegador...")
+    print("[BROWSER] Opening dashboard...")
     webbrowser.open(SERVER_URL)
 
+def start_sensor_simulator():
+    """
+    Abre uma nova janela de terminal (cmd) e executa:
+      <python> <path_to>/sensor_simulator.py
+    Usa caminhos absolutos para evitar problemas de cwd.
+    """
+    script_path = os.path.join(os.path.dirname(__file__), "sensor_simulator.py")
+    if not os.path.exists(script_path):
+        print("[SIMULATOR] sensor_simulator.py não encontrado em:", script_path)
+        return
 
-# ---------------------------------------
-# MAIN
-# ---------------------------------------
-if __name__ == "__main__":
+    python_exe = sys.executable
+
+    # Comando: cmd /c start "" <python_exe> "<script_path>"
+    # Note o "" logo após start: título vazio (obrigatório se o próximo arg estiver entre aspas)
+    cmd = ["cmd", "/c", "start", "", python_exe, script_path]
+
     try:
-        print("=== RUN.PY: Inicialização do Dashboard ===\n")
+        subprocess.Popen(cmd, shell=False)
+        print(f"[SIMULATOR] Iniciado em nova janela: {script_path}")
+    except Exception as e:
+        print("[SIMULATOR] Erro ao iniciar sensor_simulator:", e)
 
-        # Mata processos ocupando a porta
-        kill_process_on_port(PORT)
+if __name__ == "__main__":
+    print("=== RUN.PY: Starting Dashboard ===")
 
-        # Inicia servidor
-        process = start_uvicorn()
-
-        # Abre navegador
+    try:
+        uvicorn_process = start_uvicorn()
         open_browser()
 
-        print("\n=== Dashboard carregado! Logs abaixo ===\n")
+        # Start the simulator in a new terminal session
+        start_sensor_simulator()
 
-        # Mantém logs fluindo
-        process.wait()
+        print("=== Dashboard loaded! Server logs below ===\n")
+
+        uvicorn_process.wait()
 
     except KeyboardInterrupt:
-        print("\n[EXIT] Encerrando servidor...")
+        print("\n[EXIT] Shutting down server…")
         try:
-            process.terminate()
+            uvicorn_process.terminate()
         except:
             pass
         sys.exit(0)
