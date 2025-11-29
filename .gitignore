@@ -1,0 +1,38 @@
+# --- Python cache ---
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pdb
+
+# Bytecode cache in any subfolder
+*/__pycache__/
+**/__pycache__/
+
+# --- Virtual environments ---
+venv/
+env/
+.venv/
+ENV/
+env.bak/
+
+# --- FastAPI / Uvicorn ---
+*.log
+
+# --- Jupyter ---
+.ipynb_checkpoints/
+
+# --- VSCode ---
+.vscode/
+
+# --- PyCharm ---
+.idea/
+
+# --- OS / Editor files ---
+.DS_Store
+Thumbs.db
+
+# --- Build / dist ---
+build/
+dist/
+*.egg-info/
