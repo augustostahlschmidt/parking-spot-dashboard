@@ -1,0 +1,253 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Monitoramento de Vagas de Estacionamento</title>
+
+<style>
+  body {
+    margin: 0;
+    font-family: Arial, Helvetica, sans-serif;
+    background: #f4f5f7;
+    color: #111;
+  }
+
+  /* Header */
+  .site-header {
+    background: linear-gradient(90deg, #0ea5e9, #6366f1);
+    padding: 18px 24px;
+    color: white;
+    box-shadow: 0 2px 6px rgba(0,0,0,0.15);
+  }
+
+  .header-inner {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    max-width: 1100px;
+    margin: 0 auto;
+  }
+
+  .host-status {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+  }
+
+  .host-title {
+    font-size: 13px;
+    opacity: 0.8;
+  }
+
+  .host-url {
+    font-weight: bold;
+  }
+
+  /* Badge */
+  .badge {
+    display: inline-block;
+    padding: 6px 12px;
+    font-size: 13px;
+    font-weight: 700;
+    border-radius: 8px;
+    color: white;
+    min-width: 80px;
+    text-align: center;
+  }
+
+  .badge-green {
+    background-color: #16a34a;
+  }
+  .badge-red {
+    background-color: #ef4444;
+  }
+
+  /* Botão */
+  .btn {
+    padding: 8px 14px;
+    border-radius: 6px;
+    cursor: pointer;
+    border: none;
+    font-weight: bold;
+  }
+  .btn-secondary {
+    background: #e2e8f0;
+  }
+
+  /* Layout principal */
+  .main-wrapper {
+    display: flex;
+    justify-content: center;
+    padding: 35px 20px;
+  }
+
+  .slots-section {
+    background: white;
+    padding: 24px;
+    border-radius: 10px;
+    width: 380px;
+    box-shadow: 0 4px 18px rgba(0,0,0,0.07);
+  }
+
+  .slots-title {
+    margin-top: 0;
+    margin-bottom: 16px;
+    font-size: 22px;
+    font-weight: bold;
+  }
+
+  /* Tabela */
+  .slots-table {
+    width: 100%;
+    border-collapse: collapse;
+  }
+
+  .slots-table th,
+  .slots-table td {
+    padding: 10px 8px;
+    border-bottom: 1px solid #e5e7eb;
+    text-align: left;
+  }
+
+  .last-update {
+    margin-top: 12px;
+    font-size: 13px;
+    color: #6b7280;
+  }
+</style>
+</head>
+
+<body>
+
+<header class="site-header">
+  <div class="header-inner">
+
+    <h1>Dashboard Monitoramento de Vagas</h1>
+
+    <div class="host-status" aria-live="polite">
+      <div>
+        <div class="host-title">Host</div>
+        <div id="host-url" class="host-url">—</div>
+      </div>
+
+      <div id="api-status-text"></div>
+    </div>
+
+    <button id="btn-api" class="btn btn-secondary">API</button>
+  </div>
+</header>
+
+
+<main class="main-wrapper">  
+  <section class="slots-section">
+
+    <h2 class="slots-title">Vagas</h2>
+
+    <table id="slots-table" class="slots-table">
+      <thead>
+        <tr><th>Vaga</th><th>Status</th></tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+
+    <p class="last-update">
+      Última atualização: <span id="last-update">—</span>
+    </p>
+
+  </section>
+</main>
+
+
+<script>
+/* ======== CONFIG ======== */
+const API_BASE = window.location.origin;
+const EVENTS_URL = API_BASE + "/events";
+const SLOTS_COUNT = 10;
+
+const slotIds = Array.from({length: SLOTS_COUNT}, (_, i) => `slot-${i+1}`);
+
+
+/* ======== DOM ======== */
+const tbody = document.querySelector("#slots-table tbody");
+const hostUrlEl = document.getElementById("host-url");
+const apiStatusText = document.getElementById("api-status-text");
+const lastUpdateEl = document.getElementById("last-update");
+document.getElementById("btn-api").onclick = () => window.location.href = "/docs";
+
+
+/* ======== UI ======== */
+function buildUI() {
+  hostUrlEl.textContent = API_BASE;
+
+  tbody.innerHTML = "";
+  slotIds.forEach((id, idx) => {
+    const tr = document.createElement("tr");
+
+    const tdSlot = document.createElement("td");
+    tdSlot.textContent = `Vaga ${idx+1}`;
+
+    const tdStatus = document.createElement("td");
+    tdStatus.id = `status-${id}`;
+    tdStatus.innerHTML = `<span class="badge badge-green">Livre</span>`;
+
+    tr.appendChild(tdSlot);
+    tr.appendChild(tdStatus);
+    tbody.appendChild(tr);
+  });
+
+  setAPIStatus(false);
+}
+
+buildUI();
+
+
+/* ======== API STATUS ======== */
+function setAPIStatus(online){
+  if (online) {
+    apiStatusText.innerHTML = `<span class="badge badge-green">Online</span>`;
+  } else {
+    apiStatusText.innerHTML = `<span class="badge badge-red">Offline</span>`;
+  }
+}
+
+
+/* ======== SSE ======== */
+let eventSource = null;
+
+function startSSE() {
+  eventSource = new EventSource(EVENTS_URL);
+
+  eventSource.onopen = () => setAPIStatus(true);
+
+  eventSource.onerror = () => setAPIStatus(false);
+
+  eventSource.onmessage = (e) => {
+    const data = JSON.parse(e.data);
+    updateSlot(data);
+  };
+}
+
+startSSE();
+
+
+/* ======== Atualiza status ======== */
+function updateSlot(payload) {
+  const id = payload.device_id;
+  const occupied = Number(payload.predicted_occupied) === 1;
+
+  const td = document.getElementById(`status-${id}`);
+  if (!td) return;
+
+  td.innerHTML = `
+    <span class="badge ${occupied ? "badge-red" : "badge-green"}">
+      ${occupied ? "Ocupado" : "Livre"}
+    </span>
+  `;
+
+  lastUpdateEl.textContent = new Date().toLocaleString();
+}
+</script>
+
+</body>
+</html>

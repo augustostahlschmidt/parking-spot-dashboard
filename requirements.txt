@@ -1,0 +1,7 @@
+fastapi
+uvicorn[standard]
+joblib
+scikit-learn
+pandas
+paho-mqtt
+asyncio-mqtt
