@@ -30,14 +30,30 @@ import logging
 import numpy as np
 import threading
 
-# try import paho (required for MQTT thread)
 try:
     import paho.mqtt.client as paho
 except Exception:
     paho = None
 
+try:
+    import pandas as pd
+except Exception:
+    pd = None
+
+# ---------------------------
+# Logging configuration
+# ---------------------------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("parking_rf_model")
+
+try:
+    fh = logging.FileHandler("app_mqtt_details.log", encoding="utf-8")
+    fh.setLevel(logging.INFO)
+    fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+    fh.setFormatter(fmt)
+    logger.addHandler(fh)
+except Exception:
+    logger.warning("Could not create file handler for detailed logs; continuing with console only.")
 
 # ---------------------------
 # Config
@@ -140,32 +156,85 @@ class InferenceEngine:
         self._history = defaultdict(lambda: deque(maxlen=500))
         self._has_proba = hasattr(self.model, "predict_proba")
 
+    def _build_dataframe_if_possible(self, X):
+        """
+        Try to build a pd.DataFrame with appropriate column names to avoid sklearn warning.
+        If model has feature_names_in_, use them. Otherwise use sensible defaults.
+        Returns (X_for_model, used_dataframe_flag)
+        """
+        if pd is None:
+            return X, False
+
+        if hasattr(self.model, "feature_names_in_"):
+            feature_names = list(getattr(self.model, "feature_names_in_"))
+        else:
+            feature_names = ["distance_cm", "distance_filt", "dist_diff", "dist_ddiff"]
+
+        try:
+            X_df = pd.DataFrame(X, columns=feature_names)
+            return X_df, True
+        except Exception:
+            return X, False
+
     def process(self, device_id: str, distance: float, timestamp=None):
         X, meta = self.fe.add_reading(device_id, distance, timestamp)
-        pred = int(self.model.predict(X)[0])
+
+        pred = None
         prob = None
-        if self._has_proba:
-            try:
-                prob = float(self.model.predict_proba(X)[0][pred])
-            except Exception:
-                prob = None
+
+        X_for_model, used_df = self._build_dataframe_if_possible(X)
+        try:
+            pred = int(self.model.predict(X_for_model)[0])
+            if self._has_proba:
+                try:
+                    prob = float(self.model.predict_proba(X_for_model)[0][pred])
+                except Exception:
+                    prob = None
+        except Exception:
+            pred = int(self.model.predict(X)[0])
+            if self._has_proba:
+                try:
+                    prob = float(self.model.predict_proba(X)[0][pred])
+                except Exception:
+                    prob = None
 
         now = meta["timestamp"] or datetime.utcnow()
 
         last_pub = self._last_published.get(device_id)
         publish = False
+        rationale_code = None
+        rationale_detail = {
+            "distance": float(distance),
+            "distance_filt": float(meta.get("distance_filt", distance)),
+            "dist_diff": float(meta.get("dist_diff", 0.0)),
+            "dist_ddiff": float(meta.get("dist_ddiff", 0.0)),
+            "buffer_len": meta.get("buffer_len", 0),
+            "prev_pred": last_pub,
+            "prob": prob
+        }
 
         if last_pub is None:
             publish = True
             self._candidate_counts[device_id] = 1
+            rationale_code = "first_publish"
         else:
             if pred == last_pub:
                 self._candidate_counts[device_id] = 0
+                rationale_code = "no_change_reset"
             else:
+
                 self._candidate_counts[device_id] += 1
+                rationale_detail["candidate_count"] = self._candidate_counts[device_id]
                 if self._candidate_counts[device_id] >= self.debounce_k:
-                    if datetime.utcnow() - self._last_publish_time[device_id] >= self.cooldown:
+                    elapsed = datetime.utcnow() - self._last_publish_time[device_id]
+                    rationale_detail["cooldown_elapsed_s"] = elapsed.total_seconds()
+                    if elapsed >= self.cooldown:
                         publish = True
+                        rationale_code = "debounce_reached_and_cooldown_ok"
+                    else:
+                        rationale_code = "debounce_reached_but_cooldown_not_ok"
+                else:
+                    rationale_code = "debounce_not_reached"
 
         out = {
             "device_id": device_id,
@@ -176,7 +245,11 @@ class InferenceEngine:
             "dist_ddiff": float(meta["dist_ddiff"]),
             "predicted_occupied": int(pred),
             "prob": prob,
-            "buffer_len": meta["buffer_len"]
+            "buffer_len": meta["buffer_len"],
+            "rationale": {
+                "code": rationale_code,
+                "detail": rationale_detail
+            }
         }
 
         self._history[device_id].append(out)
@@ -186,23 +259,14 @@ class InferenceEngine:
             self._last_published[device_id] = pred
             self._candidate_counts[device_id] = 0
             return out, True
-        else:
-            return out, False
 
-    def last_state(self, device_id: str):
-        return {
-            "last_pred": self._last_published.get(device_id),
-            "last_publish_time": self._last_publish_time.get(device_id).isoformat() if self._last_publish_time.get(device_id) != datetime.min else None,
-            "buffer": list(self.fe.buffers[device_id]),
-            "recent": list(self._history[device_id])[-10:]
-        }
+        return out, False
 
 # ---------------------------
 # App and SSE broadcaster
 # ---------------------------
 app = FastAPI(title="Parking Inference API")
 
-# CORS: em dev podemos usar "*" mas restrinja em produção
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -211,7 +275,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Serve arquivos estáticos (index.html, styles.css, app.js, logs.html) a partir de ./static
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
 if not os.path.isdir(STATIC_DIR):
     logger.warning("Static directory %s not found. Crie a pasta 'static' e coloque index.html, app.js, styles.css, logs.html.", STATIC_DIR)
@@ -303,7 +366,6 @@ def _start_paho_mqtt_thread(broker_host, broker_port, topic_wildcard="parking/+/
             logger.warning("MQTT message missing device_id or distance_cm: %s", data)
             return
 
-        # Process inference synchronously in this thread
         try:
             out, published = IE.process(device, float(distance), ts)
         except Exception:
@@ -311,21 +373,31 @@ def _start_paho_mqtt_thread(broker_host, broker_port, topic_wildcard="parking/+/
             return
 
         if published:
-            # schedule notify on asyncio loop (if available)
+            try:
+                rationale = out.get("rationale", {})
+                logger.info(
+                    "PUBLISH MQTT: device=%s new=%s prob=%s rationale=%s detail=%s",
+                    out.get("device_id"),
+                    "Ocupado" if out.get("predicted_occupied") == 1 else "Livre",
+                    out.get("prob"),
+                    rationale.get("code"),
+                    json.dumps(rationale.get("detail", {}), ensure_ascii=False),
+                )
+            except Exception:
+                logger.exception("Failed to log publication for MQTT message.")
             if loop is not None and not loop.is_closed():
                 try:
                     asyncio.run_coroutine_threadsafe(_notify_subscribers(out), loop)
                 except Exception:
                     logger.exception("Failed to schedule _notify_subscribers on event loop")
             else:
-                # fallback (rare): create new task on current loop
                 try:
                     asyncio.create_task(_notify_subscribers(out))
                 except Exception:
                     logger.exception("Failed to create fallback asyncio task for _notify_subscribers")
 
     def mqtt_worker():
-        global _mqtt_client  # use global, not nonlocal
+        global _mqtt_client
         client = paho.Client()
         if username:
             client.username_pw_set(username, password)
@@ -408,7 +480,6 @@ async def shutdown_event():
 # ---------------------------
 # HTTP endpoints
 # ---------------------------
-# serve index.html on root
 @app.get("/", response_class=HTMLResponse)
 def root():
     index_path = os.path.join(STATIC_DIR, "index.html")
@@ -416,7 +487,6 @@ def root():
         return FileResponse(index_path, media_type="text/html")
     return HTMLResponse("<h1>Index not found</h1>", status_code=404)
 
-# POST /readings (mantido para compatibilidade)
 @app.post("/readings")
 async def readings(r: Reading):
     device = r.device_id
@@ -429,17 +499,27 @@ async def readings(r: Reading):
         raise HTTPException(status_code=500, detail=str(e))
 
     if published:
-        # push to SSE subscribers (non-blocking)
+        try:
+            rationale = out.get("rationale", {})
+            logger.info(
+                "PUBLISH HTTP: device=%s new=%s prob=%s rationale=%s detail=%s",
+                out.get("device_id"),
+                "Ocupado" if out.get("predicted_occupied") == 1 else "Livre",
+                out.get("prob"),
+                rationale.get("code"),
+                json.dumps(rationale.get("detail", {}), ensure_ascii=False),
+            )
+        except Exception:
+            logger.exception("Failed to log publication for HTTP reading.")
+
         asyncio.create_task(_notify_subscribers(out))
 
     return {"published": bool(published), "result": out}
 
-# GET /state/{device_id}
 @app.get("/state/{device_id}")
 def state(device_id: str):
     return IE.last_state(device_id)
 
-# SSE endpoint
 @app.get("/events")
 async def events():
     q = asyncio.Queue(maxsize=100)
@@ -450,10 +530,9 @@ async def events():
             while True:
                 try:
                     payload = await asyncio.wait_for(queue.get(), timeout=15.0)
-                    data = json.dumps(payload)
+                    data = json.dumps(payload, ensure_ascii=False)
                     yield f"data: {data}\n\n"
                 except asyncio.TimeoutError:
-                    # keep-alive comment to keep proxies from closing connection
                     yield ": keepalive\n\n"
         except asyncio.CancelledError:
             logger.info("SSE client disconnected")
@@ -463,7 +542,6 @@ async def events():
 
     return StreamingResponse(event_generator(q), media_type="text/event-stream")
 
-# simple healthcheck
 @app.get("/health")
 def health():
     return {"status": "ok"}
